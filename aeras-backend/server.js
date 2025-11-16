@@ -1,6 +1,6 @@
 // AERAS Backend Server - FIXED VERSION
 // All test cases 8-12 with proper error handling
-
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
@@ -88,6 +88,8 @@ db.serialize(() => {
     FOREIGN KEY(rideID) REFERENCES rides(rideID)
   )`);
   
+  
+
   // Indexes for performance
   db.run(`CREATE INDEX IF NOT EXISTS idx_rides_status ON rides(status)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_rides_time ON rides(requestTime DESC)`);
@@ -148,6 +150,8 @@ function calculatePoints(distanceMeters) {
 }
 
 // ========== USER SIDE ENDPOINTS ==========
+// Serve static files for user app
+app.use('/rickshaw', express.static(path.join(__dirname, 'public/rickshaw-app')));
 
 // 1. RIDE REQUEST
 app.post('/api/ride/request', (req, res) => {
@@ -192,18 +196,17 @@ app.post('/api/ride/request', (req, res) => {
   );
 });
 
-// 2. GET RIDE STATUS (TEST CASE 4: For LED updates)
+// 2. RIDE STATUS CHECK
 app.get('/api/ride/status', (req, res) => {
   const { blockID } = req.query;
-  
+
   if (!blockID) {
     return res.status(400).json({ error: 'blockID required' });
   }
-  
+
   db.get(
     `SELECT * FROM rides 
      WHERE pickupBlock = ? 
-     AND status IN ('PENDING', 'ACCEPTED', 'PICKUP', 'TIMEOUT') 
      ORDER BY requestTime DESC 
      LIMIT 1`,
     [blockID],
@@ -211,12 +214,14 @@ app.get('/api/ride/status', (req, res) => {
       if (err) {
         return res.status(500).json({ error: err.message });
       }
-      
+
+      // NO rides → IDLE
       if (!row) {
         return res.json({ status: 'IDLE' });
       }
-      
-      res.json({ 
+
+      // Return exact status INCLUDING COMPLETED
+      return res.json({
         status: row.status,
         rideID: row.rideID,
         rickshawID: row.rickshawID
@@ -224,6 +229,7 @@ app.get('/api/ride/status', (req, res) => {
     }
   );
 });
+
 
 // ========== RICKSHAW SIDE ENDPOINTS ==========
 
@@ -302,59 +308,78 @@ app.post('/api/ride/accept', (req, res) => {
   if (!rideID || !rickshawID) {
     return res.status(400).json({ error: 'Missing fields' });
   }
-  
+
   console.log(`\n🤝 ${rickshawID} attempting to accept ride ${rideID}`);
-  
-  // FIXED: Use transaction to handle race condition
+
   db.serialize(() => {
     db.run('BEGIN TRANSACTION');
-    
-    // Check if still pending
-    db.get('SELECT status FROM rides WHERE rideID = ?', [rideID], (err, ride) => {
-      if (err) {
-        db.run('ROLLBACK');
-        return res.status(500).json({ error: err.message });
-      }
-      
-      if (!ride || ride.status !== 'PENDING') {
-        db.run('ROLLBACK');
-        console.log(`✗ Ride ${rideID} already taken`);
-        return res.json({ 
-          success: false, 
-          message: 'Ride already taken by another puller' 
-        });
-      }
-      
-      // Accept ride (atomic)
-      db.run(
-        `UPDATE rides 
-         SET status = 'ACCEPTED', 
-             rickshawID = ?, 
-             acceptTime = CURRENT_TIMESTAMP 
-         WHERE rideID = ? AND status = 'PENDING'`,
-        [rickshawID, rideID],
-        function(err) {
-          if (err) {
-            db.run('ROLLBACK');
-            return res.status(500).json({ error: err.message });
-          }
-          
-          if (this.changes === 0) {
-            db.run('ROLLBACK');
-            return res.json({ success: false, message: 'Race condition' });
-          }
-          
-          // Update rickshaw status
-          db.run('UPDATE rickshaws SET status = "ON_RIDE" WHERE rickshawID = ?', [rickshawID]);
-          
-          db.run('COMMIT');
-          console.log(`✓ Ride ${rideID} accepted by ${rickshawID}`);
-          res.json({ success: true, rideID: rideID });
+
+    // 1. Check if the ride is still pending
+    db.get(
+      'SELECT * FROM rides WHERE rideID = ?',
+      [rideID],
+      (err, ride) => {
+        if (err) {
+          db.run('ROLLBACK');
+          return res.status(500).json({ error: err.message });
         }
-      );
-    });
+
+        if (!ride || ride.status !== 'PENDING') {
+          db.run('ROLLBACK');
+          console.log(`✗ Ride ${rideID} already taken`);
+          return res.json({
+            success: false,
+            message: 'Ride already taken by another puller'
+          });
+        }
+
+        // 2. Accept ride (atomic)
+        db.run(
+          `UPDATE rides 
+           SET status = 'ACCEPTED',
+               rickshawID = ?,
+               acceptTime = CURRENT_TIMESTAMP
+           WHERE rideID = ? AND status = 'PENDING'`,
+          [rickshawID, rideID],
+          function(err) {
+            if (err) {
+              db.run('ROLLBACK');
+              return res.status(500).json({ error: err.message });
+            }
+
+            if (this.changes === 0) {
+              db.run('ROLLBACK');
+              return res.json({ success: false, message: 'Race condition' });
+            }
+
+            // 3. Update rickshaw status
+            db.run(
+              'UPDATE rickshaws SET status = "ON_RIDE" WHERE rickshawID = ?',
+              [rickshawID]
+            );
+
+            // 4. Commit the transaction
+            db.run('COMMIT');
+
+            console.log(`✓ Ride ${rideID} accepted by ${rickshawID}`);
+
+            // 5. Return full ride info for frontend + ESP32 hardware
+            return res.json({
+              success: true,
+              rideID: rideID,
+              pickupBlock: ride.pickupBlock,
+              destination: ride.destination,
+              userLat: ride.userLat,
+              userLng: ride.userLng,
+              message: "Ride accepted"
+            });
+          }
+        );
+      }
+    );
   });
 });
+
 
 // 6. CONFIRM PICKUP (TEST CASE 9: Status sync)
 app.post('/api/ride/pickup', (req, res) => {

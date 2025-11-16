@@ -1,7 +1,7 @@
 /*
  * AERAS Rickshaw Side - GPS SIMULATED VERSION (FIXED)
- * Fixed: GPS movement logic, point calculation, race conditions
- * Implements Test Cases 6 & 7
+ * Added: Web app synchronization via /ride/pending endpoint
+ * Minimal changes to original code
  */
 
 #include <Arduino.h>
@@ -33,7 +33,6 @@ struct Location {
   String name;
 };
 
-// TEST CASE 7: Exact coordinates from rubric
 Location locations[] = {
   {22.4633, 91.9714, "CUET_CAMPUS"},
   {22.4725, 91.9845, "PAHARTOLI"},
@@ -41,11 +40,10 @@ Location locations[] = {
   {22.4520, 91.9650, "RAOJAN"}
 };
 
-// Current position (starts at CUET Campus)
 double currentLat = 22.4633;
 double currentLng = 91.9714;
 
-// Active ride info
+// ===== Active ride info =====
 String currentRideID = "";
 String pickupLocation = "";
 String destinationLocation = "";
@@ -54,10 +52,11 @@ bool pickupConfirmed = false;
 
 // Simulated movement
 Location targetLocation;
-double speedKmPerHour = 15.0; // 15 km/h
+double speedKmPerHour = 15.0;
 unsigned long lastMoveTime = 0;
 unsigned long lastLocationUpdate = 0;
 unsigned long lastRideCheck = 0;
+unsigned long lastStatusCheck = 0;  // NEW: For checking accepted status
 
 // ===== Helper Functions =====
 void displayMessage(String line1, String line2, String line3 = "") {
@@ -78,9 +77,8 @@ void displayMessage(String line1, String line2, String line3 = "") {
   display.display();
 }
 
-// FIXED: Haversine formula - returns distance in METERS
 double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
-  double R = 6371000.0; // Earth radius in meters
+  double R = 6371000.0;
   double dLat = (lat2 - lat1) * PI / 180.0;
   double dLon = (lon2 - lon1) * PI / 180.0;
   
@@ -89,28 +87,23 @@ double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
              sin(dLon/2) * sin(dLon/2);
   
   double c = 2 * atan2(sqrt(a), sqrt(1-a));
-  return R * c; // Returns METERS
+  return R * c;
 }
 
 void setTargetLocation(String locationName) {
-  // Match exact block IDs from rubric
-  locationName.toUpperCase(); // Convert to uppercase for matching
+  locationName.toUpperCase();
   
   Serial.println("Searching for location: " + locationName);
   
   for (int i = 0; i < 4; i++) {
-    // Try multiple matching strategies
     bool match = false;
     
-    // Direct match with block ID
     if (locations[i].name == locationName) {
       match = true;
     }
-    // Match with location contains search term
     else if (locations[i].name.indexOf(locationName) >= 0) {
       match = true;
     }
-    // Match common name variations
     else if (locationName.indexOf("PAHARTOLI") >= 0 && locations[i].name == "PAHARTOLI") {
       match = true;
     }
@@ -129,19 +122,16 @@ void setTargetLocation(String locationName) {
       Serial.println("✓ Target set: " + targetLocation.name);
       Serial.println("  Coords: " + String(targetLocation.lat, 6) + ", " + String(targetLocation.lng, 6));
       
-      // Calculate initial distance
       double dist = calculateDistance(currentLat, currentLng, targetLocation.lat, targetLocation.lng);
       Serial.println("  Distance: " + String(dist, 1) + " m");
       return;
     }
   }
   
-  // If not found, try to find by searching for keywords
   Serial.println("✗ Location not found, trying partial match...");
   
-  // Default to PAHARTOLI if destination not found
   if (locationName.indexOf("PAHAR") >= 0 || locationName.indexOf("Pahar") >= 0) {
-    targetLocation = locations[1]; // PAHARTOLI
+    targetLocation = locations[1];
     Serial.println("✓ Matched to PAHARTOLI");
   } else {
     Serial.println("✗ Could not find location: " + locationName);
@@ -200,10 +190,173 @@ void registerRickshaw() {
   http.end();
 }
 
-// ===== TEST CASE 8: Check for Ride Requests =====
+// ===== NEW: Check if web app accepted a ride =====
+void checkWebAppAcceptance() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (onActiveRide) return;  // Already on a ride
+  if (currentRideID == "") return;  // No pending ride to check
+  if (millis() - lastStatusCheck < 2000) return;  // Check every 2 seconds
+  
+  lastStatusCheck = millis();
+  
+  HTTPClient http;
+  String url = String(BACKEND_URL) + "/admin/rides?limit=10";
+  
+  http.begin(url);
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String response = http.getString();
+    
+    // Only look for OUR current pending ride ID
+    String searchString = "\"rideID\":" + currentRideID;
+    int ridePos = response.indexOf(searchString);
+    
+    if (ridePos > 0) {
+      // Found our ride, now check its status
+      int statusPos = response.indexOf("\"status\":\"", ridePos);
+      if (statusPos > 0 && statusPos < ridePos + 500) {  // Within same ride object
+        int statusStart = statusPos + 10;
+        int statusEnd = response.indexOf("\"", statusStart);
+        String status = response.substring(statusStart, statusEnd);
+        
+        // Check if assigned to us
+        int rickshawPos = response.indexOf("\"rickshawID\":\"", ridePos);
+        if (rickshawPos > 0 && rickshawPos < ridePos + 500) {
+          int rickStart = rickshawPos + 14;
+          int rickEnd = response.indexOf("\"", rickStart);
+          String assignedRick = response.substring(rickStart, rickEnd);
+          
+          if (assignedRick == rickshawID && status == "ACCEPTED") {
+            // Web app accepted! Extract ride details if we don't have them
+            if (pickupLocation == "") {
+              int pickupPos = response.indexOf("\"pickupBlock\":\"", ridePos);
+              int pickupStart = pickupPos + 15;
+              int pickupEnd = response.indexOf("\"", pickupStart);
+              pickupLocation = response.substring(pickupStart, pickupEnd);
+            }
+            
+            if (destinationLocation == "") {
+              int destPos = response.indexOf("\"destination\":\"", ridePos);
+              int destStart = destPos + 15;
+              int destEnd = response.indexOf("\"", destStart);
+              destinationLocation = response.substring(destStart, destEnd);
+            }
+            
+            Serial.println("\n🌐 WEB APP ACCEPTED RIDE!");
+            Serial.println("   Ride ID: " + currentRideID);
+            Serial.println("   Pickup: " + pickupLocation);
+            Serial.println("   Destination: " + destinationLocation);
+            
+            onActiveRide = true;
+            pickupConfirmed = false;
+            
+            setTargetLocation(pickupLocation);
+            
+            displayMessage("Web Accepted!", "Going to pickup", pickupLocation);
+            delay(2000);
+            
+            return;
+          }
+        }
+      }
+    }
+  }
+  
+  http.end();
+}
+
+// ===== NEW: Check for ride status updates (pickup/complete) =====
+void checkRideStatusUpdates() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!onActiveRide) return;  // Only check when on active ride
+  if (currentRideID == "") return;
+  if (millis() - lastStatusCheck < 1500) return;  // Check every 1.5 seconds (faster!)
+  
+  lastStatusCheck = millis();
+  
+  HTTPClient http;
+  String url = String(BACKEND_URL) + "/admin/rides?limit=10";
+  
+  http.begin(url);
+  http.setTimeout(3000);
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String response = http.getString();
+    
+    // Look for our current ride
+    String searchString = "\"rideID\":" + currentRideID;
+    int ridePos = response.indexOf(searchString);
+    
+    if (ridePos > 0) {
+      // Check status
+      int statusPos = response.indexOf("\"status\":\"", ridePos);
+      if (statusPos > 0 && statusPos < ridePos + 500) {
+        int statusStart = statusPos + 10;
+        int statusEnd = response.indexOf("\"", statusStart);
+        String status = response.substring(statusStart, statusEnd);
+        
+        // Debug logging
+        static String lastStatus = "";
+        if (status != lastStatus) {
+          Serial.println("Status changed: " + lastStatus + " -> " + status);
+          lastStatus = status;
+        }
+        
+        // NEW: Check if pickup was confirmed from web app
+        if (status == "PICKUP" && !pickupConfirmed) {
+          Serial.println("\n🌐 🌐 🌐 WEB APP CONFIRMED PICKUP! 🌐 🌐 🌐");
+          pickupConfirmed = true;
+          
+          // Extract destination if we don't have it
+          if (destinationLocation == "") {
+            int destPos = response.indexOf("\"destination\":\"", ridePos);
+            if (destPos > 0) {
+              int destStart = destPos + 15;
+              int destEnd = response.indexOf("\"", destStart);
+              destinationLocation = response.substring(destStart, destEnd);
+            }
+          }
+          
+          Serial.println("🗺️ Setting navigation to DESTINATION...");
+          Serial.println("   Destination: " + destinationLocation);
+          setTargetLocation(destinationLocation);
+          
+          displayMessage("Web Pickup OK", "Going to dest", destinationLocation);
+          delay(2000);
+          
+          Serial.println("\n🚗 DRIVING TO DESTINATION...\n");
+        }
+        // Check if ride was completed from web app
+        else if (status == "COMPLETED" && onActiveRide) {
+          Serial.println("\n🌐 🌐 🌐 WEB APP COMPLETED RIDE! 🌐 🌐 🌐");
+          Serial.println("   Resetting system...");
+          
+          onActiveRide = false;
+          pickupConfirmed = false;
+          currentRideID = "";
+          pickupLocation = "";
+          destinationLocation = "";
+          
+          displayStatus("AVAILABLE", "Waiting for rides");
+          Serial.println("✓ System reset - Ready for new rides\n");
+        }
+      }
+    } else {
+      Serial.println("⚠️ Could not find ride " + currentRideID + " in response");
+    }
+  } else {
+    Serial.println("✗ HTTP Error checking status: " + String(httpCode));
+  }
+  
+  http.end();
+}
+
+// ===== Check for Ride Requests (using /ride/pending) =====
 void checkForRideRequests() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (millis() - lastRideCheck < 3000) return; // Check every 3 seconds
+  if (millis() - lastRideCheck < 3000) return;
   lastRideCheck = millis();
   
   HTTPClient http;
@@ -216,50 +369,40 @@ void checkForRideRequests() {
     String response = http.getString();
     
     if (response.indexOf("\"rides\":[") > 0 && response.indexOf("\"rideID\":") > 0) {
-      // Extract first ride info
       int rideIDStart = response.indexOf("\"rideID\":") + 9;
       int rideIDEnd = response.indexOf(",", rideIDStart);
       String rideID = response.substring(rideIDStart, rideIDEnd);
       
-      // Only show if different from current
       if (rideID != currentRideID || currentRideID == "") {
         
-        // Extract pickup location (blockID)
         int pickupStart = response.indexOf("\"pickupBlock\":\"") + 15;
         int pickupEnd = response.indexOf("\"", pickupStart);
         String pickup = response.substring(pickupStart, pickupEnd);
         
-        // Extract destination (blockID)
         int destStart = response.indexOf("\"destination\":\"") + 15;
         int destEnd = response.indexOf("\"", destStart);
         String dest = response.substring(destStart, destEnd);
         
-        // Extract distance
         int distStart = response.indexOf("\"distance\":\"") + 12;
         int distEnd = response.indexOf("\"", distStart);
         String distance = response.substring(distStart, distEnd);
         
-        // TEST CASE 5: Request notification Screen (per rubric)
         display.clearDisplay();
         display.setTextSize(1);
         display.setCursor(0, 0);
         display.println("NEW RIDE REQUEST");
         display.println("================");
         
-        // User Pickup location (block ID)
         display.print("Pickup: ");
         display.println(pickup);
         
-        // Destination
         display.print("Dest: ");
         display.println(dest);
         
-        // Estimated distance
         display.print("Distance: ");
         display.print(distance);
         display.println(" km");
         
-        // Potential points reward (estimate)
         display.print("Est.Points: ");
         float dist = distance.toFloat();
         if (dist <= 2) display.println("10");
@@ -279,7 +422,6 @@ void checkForRideRequests() {
         Serial.println("Type 'REJECT' to reject this ride");
         Serial.println("=====================================\n");
         
-        // Store for manual acceptance
         currentRideID = rideID;
         pickupLocation = pickup;
         destinationLocation = dest;
@@ -290,7 +432,7 @@ void checkForRideRequests() {
   http.end();
 }
 
-// ===== TEST CASE 6: Accept Ride =====
+// ===== Accept Ride =====
 void acceptRide() {
   if (currentRideID == "" || onActiveRide) {
     Serial.println("✗ No ride to accept or already on ride");
@@ -307,6 +449,7 @@ void acceptRide() {
   
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(5000);  // 5 second timeout
   
   String payload = "{";
   payload += "\"rideID\":" + currentRideID + ",";
@@ -327,7 +470,6 @@ void acceptRide() {
       onActiveRide = true;
       pickupConfirmed = false;
       
-      // Set target to pickup location
       Serial.println("\n🚗 Setting navigation to PICKUP location...");
       setTargetLocation(pickupLocation);
       
@@ -344,19 +486,20 @@ void acceptRide() {
     }
   } else {
     Serial.println("✗ HTTP Error: " + String(httpCode));
+    displayMessage("Accept Failed", "Try again");
+    delay(2000);
   }
   
   http.end();
 }
 
-// ===== TEST CASE 6: Confirm Pickup =====
+// ===== Confirm Pickup =====
 void confirmPickup() {
   if (!onActiveRide || pickupConfirmed) {
     Serial.println("✗ Not at pickup or already confirmed");
     return;
   }
   
-  // Check distance to pickup
   double distanceToPickup = calculateDistance(
     currentLat, currentLng,
     targetLocation.lat, targetLocation.lng
@@ -388,7 +531,6 @@ void confirmPickup() {
     Serial.println("✓ ✓ ✓ PICKUP CONFIRMED! ✓ ✓ ✓");
     pickupConfirmed = true;
     
-    // Now head to destination
     Serial.println("\n🗺️ Setting navigation to DESTINATION...");
     Serial.println("   Destination: " + destinationLocation);
     setTargetLocation(destinationLocation);
@@ -402,14 +544,13 @@ void confirmPickup() {
   http.end();
 }
 
-// ===== TEST CASE 7: Complete Ride with GPS Verification =====
+// ===== Complete Ride =====
 void completeRide() {
   if (!onActiveRide || !pickupConfirmed) {
     Serial.println("✗ Cannot complete - not on active ride");
     return;
   }
   
-  // Check distance to destination
   double distanceToTarget = calculateDistance(
     currentLat, currentLng,
     targetLocation.lat, targetLocation.lng
@@ -417,9 +558,7 @@ void completeRide() {
   
   Serial.println("Distance to destination: " + String(distanceToTarget, 2) + " m");
   
-  // TEST CASE 7: Point calculation based on distance
   if (distanceToTarget > 100) {
-    // TEST CASE 7d: Too far - requires admin review
     Serial.println("✗ TOO FAR from destination!");
     Serial.println("  Current: " + String(currentLat, 6) + ", " + String(currentLng, 6));
     Serial.println("  Target: " + String(targetLocation.lat, 6) + ", " + String(targetLocation.lng, 6));
@@ -451,7 +590,6 @@ void completeRide() {
     String response = http.getString();
     Serial.println("Response: " + response);
     
-    // Extract points
     int pointsStart = response.indexOf("\"points\":") + 9;
     int pointsEnd = response.indexOf(",", pointsStart);
     if (pointsEnd == -1) pointsEnd = response.indexOf("}", pointsStart);
@@ -461,7 +599,6 @@ void completeRide() {
     int distEnd = response.indexOf("\"", distStart);
     String dropDist = response.substring(distStart, distEnd);
     
-    // Check status
     String status = "COMPLETED";
     if (response.indexOf("\"PENDING_REVIEW\"") > 0) {
       status = "PENDING_REVIEW";
@@ -475,7 +612,6 @@ void completeRide() {
     Serial.println("  Drop Distance: " + dropDist + " m");
     Serial.println("  Total Points: " + String(totalPoints));
     
-    // TEST CASE 5: Completion Screen (from rubric)
     display.clearDisplay();
     display.setTextSize(1);
     display.setCursor(0, 0);
@@ -508,7 +644,6 @@ void completeRide() {
     
     delay(5000);
     
-    // Reset for next ride
     Serial.println("\n🔄 Resetting system for next ride...");
     onActiveRide = false;
     pickupConfirmed = false;
@@ -525,32 +660,25 @@ void completeRide() {
   http.end();
 }
 
-// ===== FIXED: GPS Movement Simulation =====
+// ===== GPS Movement Simulation =====
 void simulateMovement() {
   if (!onActiveRide) return;
   
   if (millis() - lastMoveTime > 1000) {
     double distance = calculateDistance(currentLat, currentLng, targetLocation.lat, targetLocation.lng);
     
-    if (distance > 5) { // More than 5m away - keep moving
-      // Calculate bearing to target
+    if (distance > 5) {
       double bearing = calculateBearing(currentLat, currentLng, targetLocation.lat, targetLocation.lng);
       
-      // FIXED: Move 4.17 meters per second (15 km/h = 4.17 m/s)
-      double metersPerSecond = (speedKmPerHour * 1000.0) / 3600.0; // 4.17 m/s
+      double metersPerSecond = (speedKmPerHour * 1000.0) / 3600.0;
       
-      // Convert meters to degrees (more accurate conversion)
-      // At equator: 1 degree latitude = 111,320 meters
-      // Longitude varies by latitude: 1 degree = 111,320 * cos(latitude) meters
       double latDegreesPerMeter = 1.0 / 111320.0;
       double lngDegreesPerMeter = 1.0 / (111320.0 * cos(currentLat * PI / 180.0));
       
-      // Calculate movement in meters
       double bearingRad = bearing * PI / 180.0;
       double deltaLatMeters = metersPerSecond * cos(bearingRad);
       double deltaLngMeters = metersPerSecond * sin(bearingRad);
       
-      // Convert to degrees and update position
       currentLat += deltaLatMeters * latDegreesPerMeter;
       currentLng += deltaLngMeters * lngDegreesPerMeter;
       
@@ -559,7 +687,6 @@ void simulateMovement() {
       Serial.println("   Bearing: " + String((int)bearing) + "°");
       Serial.println("   Current: " + String(currentLat, 6) + ", " + String(currentLng, 6));
     } else {
-      // Arrived at destination!
       Serial.println("\n✓ ✓ ✓ ARRIVED at " + targetLocation.name + " ✓ ✓ ✓");
       Serial.println("   Final coords: " + String(currentLat, 6) + ", " + String(currentLng, 6));
       Serial.println("   Target coords: " + String(targetLocation.lat, 6) + ", " + String(targetLocation.lng, 6));
@@ -578,17 +705,16 @@ void simulateMovement() {
   }
 }
 
-// ===== Navigation Display (TEST CASE 5: Active Ride Screen) =====
+// ===== Navigation Display =====
 void updateNavigationDisplay() {
   if (!onActiveRide) return;
   
   double distance = calculateDistance(currentLat, currentLng, targetLocation.lat, targetLocation.lng);
   double bearing = calculateBearing(currentLat, currentLng, targetLocation.lat, targetLocation.lng);
   
-  // Calculate ride duration
   static unsigned long rideStartTime = 0;
   if (rideStartTime == 0) rideStartTime = millis();
-  int rideDuration = (millis() - rideStartTime) / 1000; // seconds
+  int rideDuration = (millis() - rideStartTime) / 1000;
   int minutes = rideDuration / 60;
   int seconds = rideDuration % 60;
   
@@ -596,7 +722,6 @@ void updateNavigationDisplay() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   
-  // TEST CASE 5: Active Ride Screen - Show required info per rubric
   if (!pickupConfirmed) {
     display.println(">> TO PICKUP <<");
   } else {
@@ -605,22 +730,18 @@ void updateNavigationDisplay() {
   
   display.println("================");
   
-  // Current location (GPS)
   display.print("Now: ");
   display.print(currentLat, 4);
   display.print(",");
   display.println(currentLng, 4);
   
-  // Destination location
   display.print("To: ");
   display.println(targetLocation.name);
   
-  // Navigation guidance (direction/distance)
   display.print("Dist: ");
   display.print((int)distance);
   display.print("m ");
   
-  // Direction arrow based on bearing
   if (bearing >= 337.5 || bearing < 22.5) display.print("N");
   else if (bearing >= 22.5 && bearing < 67.5) display.print("NE");
   else if (bearing >= 67.5 && bearing < 112.5) display.print("E");
@@ -632,7 +753,6 @@ void updateNavigationDisplay() {
   
   display.println();
   
-  // Timer (ride duration)
   display.print("Time: ");
   if (minutes > 0) {
     display.print(minutes);
@@ -641,7 +761,6 @@ void updateNavigationDisplay() {
   display.print(seconds);
   display.println("s");
   
-  // Points estimate
   display.print("Est.Points: ");
   if (distance <= 50) display.println("8-10");
   else if (distance <= 100) display.println("5-8");
@@ -649,7 +768,6 @@ void updateNavigationDisplay() {
   
   display.display();
   
-  // Reset timer when ride completes
   if (distance <= 5) {
     rideStartTime = 0;
   }
@@ -760,6 +878,8 @@ void setup() {
   displayStatus("AVAILABLE", "Waiting for rides");
   Serial.println("\n=== Rickshaw " + rickshawID + " Ready ===");
   Serial.println("Location: " + String(currentLat, 6) + ", " + String(currentLng, 6));
+  Serial.println("\n✅ WEB APP SYNC ENABLED");
+  Serial.println("Hardware will detect web app acceptances automatically");
   Serial.println("\nCommands: ACCEPT, REJECT, PICKUP, COMPLETE, STATUS\n");
 }
 
@@ -769,9 +889,23 @@ void loop() {
   
   if (!onActiveRide) {
     checkForRideRequests();
+    checkWebAppAcceptance();  // Check if web app accepted
   } else {
+    // Active ride - check for status updates from web app
+    checkRideStatusUpdates();  // Check for pickup/complete from web app
     simulateMovement();
     updateNavigationDisplay();
+    
+    // Debug: Print current state every 5 seconds
+    static unsigned long lastDebug = 0;
+    if (millis() - lastDebug > 5000) {
+      lastDebug = millis();
+      Serial.println("\n--- STATUS ---");
+      Serial.println("Ride ID: " + currentRideID);
+      Serial.println("Pickup Confirmed: " + String(pickupConfirmed ? "YES" : "NO"));
+      Serial.println("Target: " + targetLocation.name);
+      Serial.println("Checking web app status...");
+    }
   }
   
   if (Serial.available()) {
